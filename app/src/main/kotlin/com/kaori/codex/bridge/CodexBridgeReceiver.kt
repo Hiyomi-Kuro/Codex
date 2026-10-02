@@ -52,6 +52,8 @@ class CodexBridgeReceiver : BroadcastReceiver() {
         return when (tool) {
             "device.info" -> deviceInfo(context)
             "device.battery" -> deviceBattery(context)
+            "adb.status" -> AdbServerClient.status()
+            "adb.shell" -> AdbServerClient.shell(args)
             "app.launch" -> launchApp(context, args)
             "ui.dump" -> accessibility()?.dumpUi() ?: accessibilityUnavailable()
             "ui.click" -> accessibility()?.click(args) ?: accessibilityUnavailable()
@@ -195,6 +197,8 @@ class CodexBridgeReceiver : BroadcastReceiver() {
         val TOOL_NAMES = listOf(
             "device.info",
             "device.battery",
+            "adb.status",
+            "adb.shell",
             "app.launch",
             "ui.dump",
             "ui.click",
