@@ -10,7 +10,7 @@ android {
 
     defaultConfig {
         applicationId 'com.kaori.codex'
-        minSdk 21
+        minSdk 24
         targetSdk 34
         versionCode 1
         versionName '1.0'
@@ -20,6 +20,7 @@ android {
 
     buildFeatures {
         viewBinding true
+        aidl true
     }
 
     compileOptions {
@@ -38,4 +39,6 @@ dependencies {
     implementation libs.androidx.appcompat
     implementation libs.material
     implementation libs.androidx.constraintlayout
+    implementation libs.shizuku.api
+    implementation libs.shizuku.provider
 }

@@ -4,7 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.os.Binder
+import android.net.Uri
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
@@ -17,24 +17,26 @@ import android.view.WindowManager
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** Handles the shell-only Codex bridge broadcast protocol. */
+/** Handles broadcasts after the Manifest DUMP permission gate accepts the ADB shell caller. */
 class CodexBridgeReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        if (!isAdbShellCaller()) {
-            val response = error("Bridge accepts only ADB shell callers")
-            setResultCode(1)
-            setResultData(encoded(response))
-            return
-        }
-
-        val response = try {
-            dispatch(context, intent)
-        } catch (exception: Exception) {
-            Log.e(TAG, "Bridge request failed", exception)
-            error(exception.message ?: exception.javaClass.simpleName)
-        }
-        setResultCode(if (response.optBoolean("ok", false)) 0 else 1)
-        setResultData(encoded(response))
+        val pendingResult = goAsync()
+        val worker = Thread({
+            val response = try {
+                dispatch(context, intent)
+            } catch (exception: Exception) {
+                Log.e(TAG, "Bridge request failed", exception)
+                error(exception.message ?: exception.javaClass.simpleName)
+            }
+            try {
+                pendingResult.setResultCode(if (response.optBoolean("ok", false)) 0 else 1)
+                pendingResult.setResultData(encoded(response))
+            } finally {
+                pendingResult.finish()
+            }
+        }, "CodexBridge")
+        worker.isDaemon = true
+        worker.start()
     }
 
     private fun dispatch(context: Context, intent: Intent): JSONObject {
@@ -57,6 +59,15 @@ class CodexBridgeReceiver : BroadcastReceiver() {
             "adb.status" -> AdbServerClient.status()
             "adb.shell" -> AdbServerClient.shell(args)
             "app.launch" -> launchApp(context, args)
+            "app.uninstall" -> uninstallApp(context, args)
+            "file.read" -> CodexFileStore.read(context, args)
+            "file.write" -> CodexFileStore.write(context, args)
+            "file.delete" -> CodexFileStore.delete(context, args)
+            "file.restore" -> CodexFileStore.restore(context, args)
+            "file.commit" -> CodexFileStore.commit(context, args)
+            "shizuku.status" -> ShizukuSupport.status(context)
+            "shizuku.request_permission" -> ShizukuSupport.requestPermission(context)
+            "shizuku.shell" -> ShizukuSupport.shell(context, args)
             "ui.dump" -> accessibility()?.dumpUi() ?: accessibilityUnavailable()
             "ui.click" -> accessibility()?.click(args) ?: accessibilityUnavailable()
             "ui.input_text" -> accessibility()?.inputText(args) ?: accessibilityUnavailable()
@@ -145,17 +156,38 @@ class CodexBridgeReceiver : BroadcastReceiver() {
         var packageName = requested
         var launchIntent = packageManager.getLaunchIntentForPackage(packageName)
         if (launchIntent == null) {
-            val application = packageManager.getInstalledApplications(PackageManager.GET_META_DATA)
-                .firstOrNull {
-                    packageManager.getApplicationLabel(it).toString().equals(requested, ignoreCase = true)
-                }
-            packageName = application?.packageName ?: return error("App not found: $requested")
-            launchIntent = packageManager.getLaunchIntentForPackage(packageName)
+            val launcherQuery = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+            val match = packageManager.queryIntentActivities(
+                launcherQuery,
+                PackageManager.MATCH_DEFAULT_ONLY,
+            ).firstOrNull {
+                packageManager.getApplicationLabel(it.activityInfo.applicationInfo)
+                    .toString().equals(requested, ignoreCase = true)
+            }
+            packageName = match?.activityInfo?.packageName ?: return error("App not found: $requested")
+            launchIntent = match.let {
+                Intent(launcherQuery).setClassName(it.activityInfo.packageName, it.activityInfo.name)
+            }
         }
         val intent = launchIntent ?: return error("App has no launch Activity: $packageName")
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         context.startActivity(intent)
         return JSONObject().put("ok", true).put("package", packageName)
+    }
+
+    private fun uninstallApp(context: Context, args: Map<String, String>): JSONObject {
+        val packageName = args["package"]?.takeIf { it.matches(PACKAGE_NAME) }
+            ?: return error("Missing or invalid package argument")
+        if (packageName == context.packageName) {
+            return error("Refusing to request self-uninstall")
+        }
+        val intent = Intent(Intent.ACTION_UNINSTALL_PACKAGE, Uri.parse("package:$packageName"))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(intent)
+        return JSONObject()
+            .put("ok", true)
+            .put("package", packageName)
+            .put("userConfirmationRequired", true)
     }
 
     private fun decodeArguments(intent: Intent): Map<String, String> {
@@ -182,14 +214,6 @@ class CodexBridgeReceiver : BroadcastReceiver() {
     private fun encoded(response: JSONObject): String =
         Base64.encodeToString(response.toString().toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
 
-    private fun isAdbShellCaller(): Boolean {
-        val callerUid = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            sentFromUid
-        } else {
-            Binder.getCallingUid()
-        }
-        return callerUid == ADB_SHELL_UID
-    }
     private fun accessibility(): CodexAccessibilityService? = CodexAccessibilityService.connected()
 
     private fun accessibilityUnavailable(): JSONObject =
@@ -204,13 +228,22 @@ class CodexBridgeReceiver : BroadcastReceiver() {
 
     private companion object {
         const val TAG = "CodexBridge"
-        const val ADB_SHELL_UID = 2000
+        val PACKAGE_NAME = Regex("[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z0-9_]+)+")
         val TOOL_NAMES = listOf(
             "device.info",
             "device.battery",
             "adb.status",
             "adb.shell",
             "app.launch",
+            "app.uninstall",
+            "file.read",
+            "file.write",
+            "file.delete",
+            "file.restore",
+            "file.commit",
+            "shizuku.status",
+            "shizuku.request_permission",
+            "shizuku.shell",
             "ui.dump",
             "ui.click",
             "ui.input_text",
