@@ -42,8 +42,7 @@
 
         <receiver
             android:name=".bridge.CodexBridgeReceiver"
-            android:exported="true"
-            android:permission="android.permission.DUMP">
+            android:exported="true">
             <intent-filter>
                 <action android:name="com.kaori.codex.CODEX_BRIDGE" />
             </intent-filter>

@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Binder
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
@@ -16,12 +17,13 @@ import android.view.WindowManager
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** Handles the shell-only, DUMP-protected Codex bridge broadcast protocol. */
+/** Handles the shell-only Codex bridge broadcast protocol. */
 class CodexBridgeReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        if (context.checkCallingPermission(android.Manifest.permission.DUMP) != PackageManager.PERMISSION_GRANTED) {
+        if (!isAdbShellCaller()) {
+            val response = error("Bridge accepts only ADB shell callers")
             setResultCode(1)
-            setResultData(encoded(error("Caller lacks android.permission.DUMP")))
+            setResultData(encoded(response))
             return
         }
 
@@ -180,6 +182,14 @@ class CodexBridgeReceiver : BroadcastReceiver() {
     private fun encoded(response: JSONObject): String =
         Base64.encodeToString(response.toString().toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
 
+    private fun isAdbShellCaller(): Boolean {
+        val callerUid = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            sentFromUid
+        } else {
+            Binder.getCallingUid()
+        }
+        return callerUid == ADB_SHELL_UID
+    }
     private fun accessibility(): CodexAccessibilityService? = CodexAccessibilityService.connected()
 
     private fun accessibilityUnavailable(): JSONObject =
@@ -194,6 +204,7 @@ class CodexBridgeReceiver : BroadcastReceiver() {
 
     private companion object {
         const val TAG = "CodexBridge"
+        const val ADB_SHELL_UID = 2000
         val TOOL_NAMES = listOf(
             "device.info",
             "device.battery",
