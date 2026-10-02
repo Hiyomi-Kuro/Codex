@@ -1,3 +1,7 @@
 <resources>
     <string name="app_name">Codex</string>
+    <string name="accessibility_service_description">Allows Codex bridge to inspect and operate the visible Android user interface.</string>
+    <string name="bridge_notification_channel_name">Codex bridge</string>
+    <string name="bridge_notification_title">Codex bridge active</string>
+    <string name="bridge_notification_text">Accessibility bridge is available for authorized ADB requests.</string>
 </resources>
