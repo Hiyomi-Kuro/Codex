@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.os.Process
 import android.util.Base64
 import android.util.DisplayMetrics
@@ -16,18 +17,55 @@ import android.view.Surface
 import android.view.WindowManager
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.UUID
+import java.util.concurrent.CancellationException
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.FutureTask
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 
 /** Handles broadcasts after the Manifest DUMP permission gate accepts the ADB shell caller. */
 class CodexBridgeReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val pendingResult = goAsync()
+        val requestId = validRequestId(intent.getStringExtra("requestId"))
+            ?: UUID.randomUUID().toString()
+        val timeoutMillis = intent.getLongExtra("timeoutMs", REQUEST_TIMEOUT_MS)
+            .coerceIn(MIN_REQUEST_TIMEOUT_MS, REQUEST_TIMEOUT_MS)
+        val task = FutureTask<JSONObject> { dispatch(context, intent, requestId) }
+        val dispatchThread = Thread(task, "CodexBridgeDispatch")
+        dispatchThread.isDaemon = true
+        dispatchThread.start()
         val worker = Thread({
+            val startedAt = SystemClock.elapsedRealtime()
             val response = try {
-                dispatch(context, intent)
+                task.get(timeoutMillis, TimeUnit.MILLISECONDS)
+            } catch (_: TimeoutException) {
+                task.cancel(true)
+                error("Bridge request timed out after " + timeoutMillis + "ms")
+                    .put("status", "timeout")
+            } catch (_: CancellationException) {
+                error("Bridge request was cancelled").put("status", "cancelled")
+            } catch (interrupted: InterruptedException) {
+                Thread.currentThread().interrupt()
+                task.cancel(true)
+                error("Bridge request wait was interrupted").put("status", "cancelled")
+            } catch (execution: ExecutionException) {
+                Log.e(TAG, "Bridge request failed", execution.cause)
+                error(execution.cause?.message ?: "Bridge request failed")
             } catch (exception: Exception) {
                 Log.e(TAG, "Bridge request failed", exception)
                 error(exception.message ?: exception.javaClass.simpleName)
             }
+            val status = when {
+                response.optString("status").isNotEmpty() -> response.optString("status")
+                response.optBoolean("pending", false) -> "pending"
+                response.optBoolean("ok", false) -> "ok"
+                else -> "error"
+            }
+            response.put("requestId", requestId)
+                .put("status", status)
+                .put("durationMs", SystemClock.elapsedRealtime() - startedAt)
             try {
                 pendingResult.setResultCode(if (response.optBoolean("ok", false)) 0 else 1)
                 pendingResult.setResultData(encoded(response))
@@ -39,17 +77,17 @@ class CodexBridgeReceiver : BroadcastReceiver() {
         worker.start()
     }
 
-    private fun dispatch(context: Context, intent: Intent): JSONObject {
+    private fun dispatch(context: Context, intent: Intent, requestId: String): JSONObject {
         return when (intent.getStringExtra("op")) {
             "ping" -> ping()
             "tools" -> tools()
             "trace" -> trace(intent)
-            "tool" -> dispatchTool(context, intent)
+            "tool" -> dispatchTool(context, intent, requestId)
             else -> error("Missing or unsupported bridge operation")
         }
     }
 
-    private fun dispatchTool(context: Context, intent: Intent): JSONObject {
+    private fun dispatchTool(context: Context, intent: Intent, requestId: String): JSONObject {
         val tool = intent.getStringExtra("tool")
             ?: return error("Missing tool name")
         val args = decodeArguments(intent)
@@ -65,12 +103,21 @@ class CodexBridgeReceiver : BroadcastReceiver() {
             "file.delete" -> CodexFileStore.delete(context, args)
             "file.restore" -> CodexFileStore.restore(context, args)
             "file.commit" -> CodexFileStore.commit(context, args)
+            "file.pick" -> CodexFileOperations.startPicker(context, args, requestId)
+            "file.save" -> CodexFileOperations.startSaver(context, args, requestId)
+            "file.result" -> CodexFileOperations.result(context, args)
+            "file.cancel" -> CodexFileOperations.cancel(context, args)
+            "file.import_selected" -> CodexFileOperations.importSelected(context, args)
+            "file.export_media" -> CodexFileOperations.exportMedia(context, args)
             "shizuku.status" -> ShizukuSupport.status(context)
             "shizuku.request_permission" -> ShizukuSupport.requestPermission(context)
             "shizuku.shell" -> ShizukuSupport.shell(context, args)
             "ui.dump" -> accessibility()?.dumpUi() ?: accessibilityUnavailable()
             "ui.click" -> accessibility()?.click(args) ?: accessibilityUnavailable()
             "ui.input_text" -> accessibility()?.inputText(args) ?: accessibilityUnavailable()
+            "ui.scroll" -> accessibility()?.scroll(args) ?: accessibilityUnavailable()
+            "ui.swipe" -> accessibility()?.swipe(args) ?: accessibilityUnavailable()
+            "ui.wait" -> accessibility()?.waitFor(args) ?: accessibilityUnavailable()
             "ui.back" -> accessibility()?.globalAction(
                 AccessibilityAction.BACK,
                 "back",
@@ -97,11 +144,11 @@ class CodexBridgeReceiver : BroadcastReceiver() {
     }
 
     private fun trace(intent: Intent): JSONObject {
-        val message = decodeBase64(intent.getStringExtra("message64"))
-        if (!message.isNullOrEmpty()) {
-            Log.i(TAG, message)
-        }
-        return JSONObject().put("ok", true).put("trace", "recorded")
+        val received = !decodeBase64(intent.getStringExtra("message64")).isNullOrEmpty()
+        return JSONObject()
+            .put("ok", true)
+            .put("trace", "recorded")
+            .put("messageReceived", received)
     }
 
     private fun deviceInfo(context: Context): JSONObject {
@@ -221,6 +268,10 @@ class CodexBridgeReceiver : BroadcastReceiver() {
 
     private fun error(message: String): JSONObject = JSONObject().put("ok", false).put("error", message)
 
+    private fun validRequestId(value: String?): String? {
+        return value?.takeIf { it.length in 1..96 && it.matches(Regex("[A-Za-z0-9._-]+")) }
+    }
+
     private object AccessibilityAction {
         const val BACK = android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK
         const val HOME = android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_HOME
@@ -228,6 +279,8 @@ class CodexBridgeReceiver : BroadcastReceiver() {
 
     private companion object {
         const val TAG = "CodexBridge"
+        const val MIN_REQUEST_TIMEOUT_MS = 1000L
+        const val REQUEST_TIMEOUT_MS = 8000L
         val PACKAGE_NAME = Regex("[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z0-9_]+)+")
         val TOOL_NAMES = listOf(
             "device.info",
@@ -241,12 +294,21 @@ class CodexBridgeReceiver : BroadcastReceiver() {
             "file.delete",
             "file.restore",
             "file.commit",
+            "file.pick",
+            "file.save",
+            "file.result",
+            "file.cancel",
+            "file.import_selected",
+            "file.export_media",
             "shizuku.status",
             "shizuku.request_permission",
             "shizuku.shell",
             "ui.dump",
             "ui.click",
             "ui.input_text",
+            "ui.scroll",
+            "ui.swipe",
+            "ui.wait",
             "ui.back",
             "ui.home",
         )

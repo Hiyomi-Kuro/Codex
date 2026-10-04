@@ -4,6 +4,9 @@ import android.util.Base64
 import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
+import java.io.OutputStream
 import java.io.FileOutputStream
 import java.io.IOException
 import java.security.MessageDigest
@@ -146,6 +149,57 @@ object CodexFileStore {
         return JSONObject().put("ok", true).put("path", relativePath).put("backupCommitted", true)
     }
 
+    /** Imports one user-selected URI into app-specific storage with the normal backup policy. */
+    fun importUri(
+        context: android.content.Context,
+        uri: android.net.Uri,
+        relativePath: String,
+        overwrite: Boolean,
+    ): JSONObject {
+        val target = targetFile(context, relativePath)
+        if (target.exists() && !overwrite) {
+            return error("File exists; set overwrite=true after reviewing the target")
+        }
+        val content = try {
+            context.contentResolver.openInputStream(uri)?.use(::readLimited)
+                ?: return error("Selected URI could not be opened")
+        } catch (exception: Exception) {
+            return error(exception.message ?: exception.javaClass.simpleName)
+        }
+        return write(
+            context,
+            mapOf(
+                "path" to relativePath,
+                "content64" to Base64.encodeToString(content, Base64.NO_WRAP),
+                "overwrite" to overwrite.toString(),
+            ),
+        )
+    }
+
+    /** Copies one app-specific file to a user-selected URI and removes partial output on failure. */
+    fun exportToUri(
+        context: android.content.Context,
+        sourcePath: String,
+        destination: android.net.Uri,
+    ): JSONObject {
+        val source = targetFile(context, sourcePath)
+        requireRegularFile(source)
+        requireSize(source)
+        return try {
+            val output = context.contentResolver.openOutputStream(destination, "wt")
+                ?: return error("Selected destination URI could not be opened")
+            val digest = output.use { copyToOutput(source, it) }
+            JSONObject()
+                .put("ok", true)
+                .put("sourcePath", sourcePath)
+                .put("size", digest.size)
+                .put("sha256", digest.hash)
+        } catch (exception: Exception) {
+            runCatching { context.contentResolver.delete(destination, null, null) }
+            error(exception.message ?: exception.javaClass.simpleName)
+        }
+    }
+
     private fun backupExisting(context: android.content.Context, relativePath: String, source: File): Backup {
         val backup = backupPaths(context, relativePath)
         if (backup.dataFile.exists() || backup.metadataFile.exists()) {
@@ -221,7 +275,7 @@ object CodexFileStore {
                     val count = input.read(buffer)
                     if (count < 0) break
                     size += count
-                    require(size <= MAX_FILE_BYTES) { "File exceeds $MAX_FILE_BYTES bytes" }
+                    require(size <= MAX_FILE_BYTES) { "File exceeds " + MAX_FILE_BYTES + " bytes" }
                     output.write(buffer, 0, count)
                 }
             }
@@ -231,6 +285,35 @@ object CodexFileStore {
             "Backup verification failed"
         }
         return digest
+    }
+
+    private fun readLimited(input: InputStream): ByteArray {
+        val output = ByteArrayOutputStream()
+        val buffer = ByteArray(BUFFER_SIZE)
+        while (true) {
+            val count = input.read(buffer)
+            if (count < 0) break
+            output.write(buffer, 0, count)
+            require(output.size() <= MAX_FILE_BYTES) { "File exceeds " + MAX_FILE_BYTES + " bytes" }
+        }
+        return output.toByteArray()
+    }
+
+    private fun copyToOutput(source: File, output: OutputStream): Digest {
+        var size = 0L
+        val digest = MessageDigest.getInstance("SHA-256")
+        FileInputStream(source).use { input ->
+            val buffer = ByteArray(BUFFER_SIZE)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                size += count
+                require(size <= MAX_FILE_BYTES) { "File exceeds " + MAX_FILE_BYTES + " bytes" }
+                digest.update(buffer, 0, count)
+                output.write(buffer, 0, count)
+            }
+        }
+        return Digest(size, digest.digest().joinToString("") { "%02x".format(it) })
     }
 
     private fun sha256(bytes: ByteArray): String =

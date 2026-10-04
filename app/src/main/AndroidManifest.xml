@@ -30,6 +30,11 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <activity
+            android:name=".bridge.CodexFilePickerActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@style/BridgeTheme" />
 
         <provider
             android:name="rikka.shizuku.ShizukuProvider"
