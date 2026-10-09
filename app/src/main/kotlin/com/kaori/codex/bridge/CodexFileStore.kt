@@ -9,37 +9,104 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.io.FileOutputStream
 import java.io.IOException
+import java.io.RandomAccessFile
 import java.security.MessageDigest
 import java.util.UUID
 
 /** Provides recoverable file operations inside Codex app-specific storage. */
 object CodexFileStore {
-    /** Reads a file from the app-specific Codex file directory. */
+    /** Reads a file inline when it fits the Binder-safe response limit. */
     fun read(context: android.content.Context, args: Map<String, String>): JSONObject {
         val relativePath = pathArgument(args)
         val file = targetFile(context, relativePath)
         requireRegularFile(file)
         requireSize(file)
         val bytes = file.readBytes()
-        return JSONObject()
+        val result = JSONObject()
             .put("ok", true)
             .put("path", relativePath)
             .put("size", bytes.size)
             .put("sha256", sha256(bytes))
+        if (bytes.size <= MAX_INLINE_BYTES) {
+            result.put("content64", Base64.encodeToString(bytes, Base64.NO_WRAP))
+        } else {
+            result
+                .put("chunked", true)
+                .put("chunkSize", MAX_CHUNK_BYTES)
+                .put("maxInlineBytes", MAX_INLINE_BYTES)
+        }
+        return result
+    }
+
+    /** Reads a bounded app-private image for in-memory visual analysis. */
+    fun readForAnalysis(context: android.content.Context, relativePath: String): ByteArray {
+        val file = targetFile(context, relativePath)
+        requireRegularFile(file)
+        require(file.length() <= MAX_ANALYSIS_BYTES) {
+            "Analysis image exceeds $MAX_ANALYSIS_BYTES bytes"
+        }
+        return file.readBytes()
+    }
+    /** Reads one bounded file chunk without placing the complete file in a broadcast result. */
+    fun readChunk(context: android.content.Context, args: Map<String, String>): JSONObject {
+        val relativePath = pathArgument(args)
+        val file = targetFile(context, relativePath)
+        requireRegularFile(file)
+        requireSize(file)
+        val offset = args["offset"]?.toLongOrNull() ?: 0L
+        require(offset >= 0L && offset <= file.length()) { "Invalid file chunk offset" }
+        val requested = args["length"]?.toIntOrNull() ?: MAX_CHUNK_BYTES
+        require(requested in 1..MAX_CHUNK_BYTES) {
+            "Chunk length must be between 1 and $MAX_CHUNK_BYTES bytes"
+        }
+        val count = minOf(requested.toLong(), file.length() - offset).toInt()
+        val bytes = ByteArray(count)
+        RandomAccessFile(file, "r").use { input ->
+            input.seek(offset)
+            var position = 0
+            while (position < count) {
+                val read = input.read(bytes, position, count - position)
+                if (read < 0) break
+                position += read
+            }
+        }
+        val nextOffset = offset + count
+        return JSONObject()
+            .put("ok", true)
+            .put("path", relativePath)
+            .put("offset", offset)
+            .put("nextOffset", nextOffset)
+            .put("size", file.length())
+            .put("eof", nextOffset >= file.length())
+            .put("sha256", sha256(file.readBytes()))
             .put("content64", Base64.encodeToString(bytes, Base64.NO_WRAP))
     }
 
-    /** Adds a file or replaces an existing file after creating a verified backup. */
+    /** Adds a file inline when it fits the Binder-safe response limit. */
     fun write(context: android.content.Context, args: Map<String, String>): JSONObject {
         val relativePath = pathArgument(args)
         val content64 = args["content64"] ?: throw IllegalArgumentException("Missing content64 argument")
         val content = Base64.decode(content64, Base64.DEFAULT)
         require(content.size <= MAX_FILE_BYTES) { "File exceeds $MAX_FILE_BYTES bytes" }
+        if (content.size > MAX_INLINE_BYTES) {
+            return error("File is larger than the inline Binder-safe limit; use file.write_begin and file.write_chunk")
+                .put("requiresChunking", true)
+                .put("size", content.size)
+                .put("maxInlineBytes", MAX_INLINE_BYTES)
+        }
+        return writeContent(context, relativePath, content, args["overwrite"] == "true")
+    }
+
+    private fun writeContent(
+        context: android.content.Context,
+        relativePath: String,
+        content: ByteArray,
+        overwrite: Boolean,
+    ): JSONObject {
         val file = targetFile(context, relativePath)
         if (file.exists() && file.isDirectory) {
             throw IllegalArgumentException("Target is a directory: $relativePath")
         }
-        val overwrite = args["overwrite"] == "true"
         if (file.exists() && !overwrite) {
             return error("File exists; set overwrite=true after reviewing the target")
         }
@@ -49,7 +116,7 @@ object CodexFileStore {
         } else {
             null
         }
-        val temporary = File(file.parentFile, ".codex-${UUID.randomUUID()}.tmp")
+        val temporary = File(file.parentFile, ".codex-" + UUID.randomUUID() + ".tmp")
         return try {
             temporary.parentFile?.mkdirs()
             FileOutputStream(temporary).use { output -> output.write(content) }
@@ -69,6 +136,54 @@ object CodexFileStore {
             error((exception.message ?: exception.javaClass.simpleName) + backupSuffix(backup))
         }
     }
+
+    /** Commits a verified chunked upload while preserving the normal backup policy. */
+    fun commitUploadedFile(
+        context: android.content.Context,
+        relativePath: String,
+        temporary: File,
+        totalSize: Long,
+        expectedSha256: String?,
+        overwrite: Boolean,
+    ): JSONObject {
+        require(totalSize in 0..MAX_FILE_BYTES) { "Invalid uploaded file size" }
+        requireRegularFile(temporary)
+        require(temporary.length() == totalSize) { "Uploaded file is incomplete" }
+        val actualSha256 = sha256(temporary.readBytes())
+        if (!expectedSha256.isNullOrBlank() && !actualSha256.equals(expectedSha256, ignoreCase = true)) {
+            return error("Uploaded file SHA-256 does not match expectedSha256")
+                .put("expectedSha256", expectedSha256)
+                .put("actualSha256", actualSha256)
+        }
+        val target = targetFile(context, relativePath)
+        if (target.exists() && target.isDirectory) {
+            return error("Target is a directory: $relativePath")
+        }
+        if (target.exists() && !overwrite) {
+            return error("File exists; set overwrite=true after reviewing the target")
+        }
+        val backup = if (target.exists()) {
+            backupExisting(context, relativePath, target)
+        } else {
+            null
+        }
+        return try {
+            if (!temporary.renameTo(target)) {
+                throw IOException("Unable to replace file: $relativePath")
+            }
+            JSONObject()
+                .put("ok", true)
+                .put("path", relativePath)
+                .put("size", totalSize)
+                .put("sha256", actualSha256)
+                .put("created", backup == null)
+                .put("backup", backupJson(backup))
+                .put("chunked", true)
+        } catch (exception: Exception) {
+            error((exception.message ?: exception.javaClass.simpleName) + backupSuffix(backup))
+        }
+    }
+
 
     /** Deletes a file only after creating a verified recoverable backup. */
     fun delete(context: android.content.Context, args: Map<String, String>): JSONObject {
@@ -166,14 +281,7 @@ object CodexFileStore {
         } catch (exception: Exception) {
             return error(exception.message ?: exception.javaClass.simpleName)
         }
-        return write(
-            context,
-            mapOf(
-                "path" to relativePath,
-                "content64" to Base64.encodeToString(content, Base64.NO_WRAP),
-                "overwrite" to overwrite.toString(),
-            ),
-        )
+        return writeContent(context, relativePath, content, overwrite)
     }
 
     /** Copies one app-specific file to a user-selected URI and removes partial output on failure. */
@@ -333,6 +441,9 @@ object CodexFileStore {
 
     private const val FILE_DIRECTORY = "codex-files"
     private const val BACKUP_DIRECTORY = "codex-backups"
-    private const val MAX_FILE_BYTES = 8 * 1024 * 1024
+    internal const val MAX_FILE_BYTES = 8 * 1024 * 1024
+    internal const val MAX_CHUNK_BYTES = 32 * 1024
+    private const val MAX_INLINE_BYTES = 32 * 1024
+    private const val MAX_ANALYSIS_BYTES = 512 * 1024
     private const val BUFFER_SIZE = 8192
 }

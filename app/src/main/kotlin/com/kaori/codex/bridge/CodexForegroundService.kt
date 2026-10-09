@@ -16,11 +16,16 @@ class CodexForegroundService : Service() {
         super.onCreate()
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, notification())
+        running = true
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
     override fun onBind(intent: Intent?): IBinder? = null
+    override fun onDestroy() {
+        running = false
+        super.onDestroy()
+    }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
@@ -43,7 +48,11 @@ class CodexForegroundService : Service() {
         .setPriority(NotificationCompat.PRIORITY_LOW)
         .build()
 
-    private companion object {
+    companion object {
+        @Volatile
+        private var running = false
+
+        fun isRunning(): Boolean = running
         const val CHANNEL_ID = "codex_bridge"
         const val NOTIFICATION_ID = 1002
     }

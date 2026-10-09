@@ -32,6 +32,13 @@ class CodexBridgeReceiver : BroadcastReceiver() {
             ?: UUID.randomUUID().toString()
         val timeoutMillis = intent.getLongExtra("timeoutMs", REQUEST_TIMEOUT_MS)
             .coerceIn(MIN_REQUEST_TIMEOUT_MS, REQUEST_TIMEOUT_MS)
+        runCatching {
+            CodexRequestStore.markPending(
+                context,
+                requestId,
+                intent.getStringExtra("tool") ?: intent.getStringExtra("op") ?: "unknown",
+            )
+        }
         val task = FutureTask<JSONObject> { dispatch(context, intent, requestId) }
         val dispatchThread = Thread(task, "CodexBridgeDispatch")
         dispatchThread.isDaemon = true
@@ -66,6 +73,11 @@ class CodexBridgeReceiver : BroadcastReceiver() {
             response.put("requestId", requestId)
                 .put("status", status)
                 .put("durationMs", SystemClock.elapsedRealtime() - startedAt)
+            runCatching { CodexRequestStore.complete(context, requestId, response) }
+            CodexHealth.record(
+                intent.getStringExtra("tool") ?: intent.getStringExtra("op") ?: "unknown",
+                response,
+            )
             try {
                 pendingResult.setResultCode(if (response.optBoolean("ok", false)) 0 else 1)
                 pendingResult.setResultData(encoded(response))
@@ -92,14 +104,22 @@ class CodexBridgeReceiver : BroadcastReceiver() {
             ?: return error("Missing tool name")
         val args = decodeArguments(intent)
         return when (tool) {
+            "bridge.health" -> CodexHealth.snapshot(context)
+            "bridge.result" -> CodexRequestStore.result(context, args)
             "device.info" -> deviceInfo(context)
             "device.battery" -> deviceBattery(context)
             "adb.status" -> AdbServerClient.status()
-            "adb.shell" -> AdbServerClient.shell(args)
+            "adb.shell" -> AdbServerClient.shell(context, args)
+            "adb.result_chunk" -> CodexResultStore.readChunk(context, args)
+            "file.read_chunk" -> CodexFileStore.readChunk(context, args)
             "app.launch" -> launchApp(context, args)
             "app.uninstall" -> uninstallApp(context, args)
             "file.read" -> CodexFileStore.read(context, args)
             "file.write" -> CodexFileStore.write(context, args)
+            "file.write_begin" -> CodexFileTransferStore.begin(context, args)
+            "file.write_chunk" -> CodexFileTransferStore.writeChunk(context, args)
+            "file.write_commit" -> CodexFileTransferStore.commit(context, args)
+            "file.write_cancel" -> CodexFileTransferStore.cancel(args)
             "file.delete" -> CodexFileStore.delete(context, args)
             "file.restore" -> CodexFileStore.restore(context, args)
             "file.commit" -> CodexFileStore.commit(context, args)
@@ -114,9 +134,16 @@ class CodexBridgeReceiver : BroadcastReceiver() {
             "shizuku.shell" -> ShizukuSupport.shell(context, args)
             "ui.dump" -> accessibility()?.dumpUi() ?: accessibilityUnavailable()
             "ui.click" -> accessibility()?.click(args) ?: accessibilityUnavailable()
+            "ui.tap" -> accessibility()?.tap(args) ?: accessibilityUnavailable("tap")
+            "ui.double_tap" -> accessibility()?.doubleTap(args) ?: accessibilityUnavailable("double_tap")
+            "ui.multi_gesture" -> accessibility()?.multiGesture(args) ?: accessibilityUnavailable("multi_gesture")
+            "ui.template_match" -> accessibility()?.templateMatch(args) ?: accessibilityUnavailable("template_match")
+            "ui.template_tap" -> accessibility()?.templateTap(args) ?: accessibilityUnavailable("template_tap")
+            "ui.long_press" -> accessibility()?.longPress(args) ?: accessibilityUnavailable("long_press")
+            "ui.ocr" -> accessibility()?.ocr(args) ?: accessibilityUnavailable("ocr")
             "ui.input_text" -> accessibility()?.inputText(args) ?: accessibilityUnavailable()
             "ui.scroll" -> accessibility()?.scroll(args) ?: accessibilityUnavailable()
-            "ui.swipe" -> accessibility()?.swipe(args) ?: accessibilityUnavailable()
+            "ui.swipe" -> accessibility()?.swipe(args) ?: accessibilityUnavailable("swipe")
             "ui.wait" -> accessibility()?.waitFor(args) ?: accessibilityUnavailable()
             "ui.back" -> accessibility()?.globalAction(
                 AccessibilityAction.BACK,
@@ -263,9 +290,15 @@ class CodexBridgeReceiver : BroadcastReceiver() {
 
     private fun accessibility(): CodexAccessibilityService? = CodexAccessibilityService.connected()
 
-    private fun accessibilityUnavailable(): JSONObject =
-        error("Accessibility service is not connected; enable Codex in Android Accessibility settings")
-
+    private fun accessibilityUnavailable(action: String? = null): JSONObject {
+        val response = error("Accessibility service is not connected; enable Codex in Android Accessibility settings")
+            .put("executed", false)
+            .put("verified", false)
+            .put("before", JSONObject.NULL)
+            .put("after", JSONObject.NULL)
+            .put("visualEvidenceAvailable", false)
+        return action?.let { response.put("action", it) } ?: response
+    }
     private fun error(message: String): JSONObject = JSONObject().put("ok", false).put("error", message)
 
     private fun validRequestId(value: String?): String? {
@@ -283,14 +316,22 @@ class CodexBridgeReceiver : BroadcastReceiver() {
         const val REQUEST_TIMEOUT_MS = 8000L
         val PACKAGE_NAME = Regex("[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z0-9_]+)+")
         val TOOL_NAMES = listOf(
+            "bridge.health",
+            "bridge.result",
             "device.info",
             "device.battery",
             "adb.status",
             "adb.shell",
+            "adb.result_chunk",
             "app.launch",
             "app.uninstall",
             "file.read",
+            "file.read_chunk",
             "file.write",
+            "file.write_begin",
+            "file.write_chunk",
+            "file.write_commit",
+            "file.write_cancel",
             "file.delete",
             "file.restore",
             "file.commit",
@@ -305,6 +346,13 @@ class CodexBridgeReceiver : BroadcastReceiver() {
             "shizuku.shell",
             "ui.dump",
             "ui.click",
+            "ui.tap",
+            "ui.double_tap",
+            "ui.multi_gesture",
+            "ui.template_match",
+            "ui.template_tap",
+            "ui.long_press",
+            "ui.ocr",
             "ui.input_text",
             "ui.scroll",
             "ui.swipe",
